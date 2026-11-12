@@ -123,6 +123,77 @@ namespace VkWorkspaceSwitcher
             finally { if (process != null) process.Dispose(); }
         }
 
+        // Deletion must distinguish a stopped process from unreadable metadata.
+        // The ordinary status reader is intentionally best effort; it is not a
+        // sufficient guard before removing a profile's local session data.
+        private Process ReadProcessForDeletion(Profile profile)
+        {
+            RunningProfile record;
+            try
+            {
+                string path = RecordPath(profile);
+                AssertRuntimePathSafe(path);
+                using (FileStream file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+                {
+                    if (file.Length > 65536) throw new InvalidDataException("Слишком большая запись процесса.");
+                    record = (RunningProfile)new DataContractJsonSerializer(typeof(RunningProfile)).ReadObject(file);
+                }
+                if (record == null || record.ProfileId != profile.Id || record.ProcessId <= 0 || record.StartedUtcTicks <= 0
+                    || String.IsNullOrWhiteSpace(record.Executable) || !Path.IsPathRooted(record.Executable)
+                    || !String.Equals(Path.GetFullPath(record.Executable), record.Executable, StringComparison.OrdinalIgnoreCase)
+                    || !String.Equals(Path.GetExtension(record.Executable), ".exe", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("Некорректная запись процесса.");
+            }
+            catch (FileNotFoundException) { return null; }
+            catch (DirectoryNotFoundException) { return null; }
+            catch (Exception error)
+            {
+                throw new InvalidOperationException("Не удалось проверить состояние этого аккаунта. Удаление отменено: " + error.Message, error);
+            }
+
+            Process process = null;
+            try
+            {
+                try { process = Process.GetProcessById(record.ProcessId); }
+                catch (ArgumentException) { return null; }
+                if (process.HasExited || process.StartTime.ToUniversalTime().Ticks != record.StartedUtcTicks)
+                    return null;
+                if (!String.Equals(process.MainModule.FileName, record.Executable, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("Путь запущенного процесса не совпадает с записью аккаунта.");
+                Process found = process;
+                process = null;
+                return found;
+            }
+            catch (Exception error)
+            {
+                // Exit can race StartTime/MainModule inspection. Only a proven
+                // exit is safe; access failures must never mean "not running".
+                if (process != null)
+                {
+                    try { if (process.HasExited) return null; }
+                    catch (InvalidOperationException) { }
+                }
+                throw new InvalidOperationException("Не удалось убедиться, что этот аккаунт закрыт. Удаление отменено: " + error.Message, error);
+            }
+            finally { if (process != null) process.Dispose(); }
+        }
+
+        private static void AssertRuntimePathSafe(string path)
+        {
+            string current = path;
+            while (!String.IsNullOrEmpty(current))
+            {
+                try
+                {
+                    if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
+                        throw new IOException("Папка состояния процесса или её родитель является ссылкой: " + current);
+                }
+                catch (FileNotFoundException) { }
+                catch (DirectoryNotFoundException) { }
+                current = Path.GetDirectoryName(current);
+            }
+        }
+
         private void SaveProcess(Profile profile, Process process)
         {
             Directory.CreateDirectory(runtimeDirectory);
@@ -268,37 +339,84 @@ namespace VkWorkspaceSwitcher
                     catch (AbandonedMutexException) { locked = true; }
                     if (!locked) throw new InvalidOperationException("Другой запуск ещё выполняется. Попробуйте через несколько секунд.");
                     using (Process process = ReadProcess(profile) ?? (profile.Id == "default" ? FindDefault() : null))
-                    {
-                        if (process == null || process.HasExited) return false;
-                        // Keep a handle open and validate the window's owner immediately before
-                        // messaging. A stale PID record must never close an unrelated process.
-                        IntPtr retainedHandle = process.Handle;
-                        int pid = process.Id;
-                        long started = process.StartTime.ToUniversalTime().Ticks;
-                        IntPtr window = FindMainWindow(process, profile);
-                        if (window == IntPtr.Zero)
-                        {
-                            if (process.HasExited) return false;
-                            throw new InvalidOperationException("Окно этого профиля пока недоступно. Дождитесь запуска VK WorkSpace и повторите закрытие.");
-                        }
-                        uint owner;
-                        uint thread = GetWindowThreadProcessId(window, out owner);
-                        if (owner != pid || thread == 0 || process.HasExited) return false;
-                        // Qt handles WM_QUIT by calling QCoreApplication::quit(), which
-                        // allows its normal shutdown path to run. WM_CLOSE just hides to tray.
-                        if (!PostThreadMessage(thread, 0x0012, IntPtr.Zero, IntPtr.Zero))
-                        {
-                            if (process.HasExited) return false;
-                            throw new Win32Exception(Marshal.GetLastWin32Error(), "Не удалось передать VK WorkSpace запрос на закрытие.");
-                        }
-                        if (!process.WaitForExit(10000))
-                            throw new InvalidOperationException("VK WorkSpace пока не завершился. Закройте открытые диалоги в этом профиле и повторите. Принудительное завершение не выполнялось.");
-                        ForgetProcess(profile, pid, started);
-                        return true;
-                    }
+                        return CloseProcess(profile, process);
                 }
                 finally { if (locked) mutex.ReleaseMutex(); }
             }
+        }
+
+        // Caller has already confirmed deletion in the launcher. Hold the same
+        // mutex as Open/Close until both data and process metadata are handled.
+        public string Delete(Profile profile)
+        {
+            profile = RegisteredProfile(profile);
+            if (profile.Id == "default") throw new InvalidOperationException("Основной аккаунт нельзя удалить из лаунчера.");
+            using (Mutex mutex = new Mutex(false, mutexName))
+            {
+                bool locked = false;
+                try
+                {
+                    try { locked = mutex.WaitOne(15000); }
+                    catch (AbandonedMutexException) { locked = true; }
+                    if (!locked) throw new InvalidOperationException("Другое действие с аккаунтом ещё выполняется. Попробуйте через несколько секунд.");
+                    using (Process process = ReadProcessForDeletion(profile))
+                    {
+                        if (process != null) CloseProcess(profile, process);
+                    }
+                    using (Process process = ReadProcessForDeletion(profile))
+                    {
+                        if (process != null) throw new InvalidOperationException("Этот аккаунт ещё работает. Дождитесь его закрытия и повторите удаление.");
+                    }
+                    string warning = launcher.RemoveProfile(profile.Id);
+                    try
+                    {
+                        string path = RecordPath(profile);
+                        AssertRuntimePathSafe(path);
+                        File.Delete(path);
+                    }
+                    catch (DirectoryNotFoundException) { }
+                    catch (IOException error) { warning = MetadataCleanupWarning(warning, error); }
+                    catch (UnauthorizedAccessException error) { warning = MetadataCleanupWarning(warning, error); }
+                    return warning;
+                }
+                finally { if (locked) mutex.ReleaseMutex(); }
+            }
+        }
+
+        private static string MetadataCleanupWarning(string warning, Exception error)
+        {
+            string message = "Аккаунт удалён, но не удалось очистить запись о его процессе: " + error.Message;
+            return String.IsNullOrEmpty(warning) ? message : warning + Environment.NewLine + message;
+        }
+
+        private bool CloseProcess(Profile profile, Process process)
+        {
+            if (process == null || process.HasExited) return false;
+            // Keep a handle open and validate the window's owner immediately before
+            // messaging. A stale PID record must never close an unrelated process.
+            IntPtr retainedHandle = process.Handle;
+            int pid = process.Id;
+            long started = process.StartTime.ToUniversalTime().Ticks;
+            IntPtr window = FindMainWindow(process, profile);
+            if (window == IntPtr.Zero)
+            {
+                if (process.HasExited) return false;
+                throw new InvalidOperationException("Окно этого профиля пока недоступно. Дождитесь запуска VK WorkSpace и повторите закрытие.");
+            }
+            uint owner;
+            uint thread = GetWindowThreadProcessId(window, out owner);
+            if (owner != pid || thread == 0 || process.HasExited) return false;
+            // Qt handles WM_QUIT by calling QCoreApplication::quit(), which
+            // allows its normal shutdown path to run. WM_CLOSE just hides to tray.
+            if (!PostThreadMessage(thread, 0x0012, IntPtr.Zero, IntPtr.Zero))
+            {
+                if (process.HasExited) return false;
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Не удалось передать VK WorkSpace запрос на закрытие.");
+            }
+            if (!process.WaitForExit(10000))
+                throw new InvalidOperationException("VK WorkSpace пока не завершился. Закройте открытые диалоги в этом профиле и повторите. Принудительное завершение не выполнялось.");
+            ForgetProcess(profile, pid, started);
+            return true;
         }
 
         private void ForgetProcess(Profile profile, int pid, long started)

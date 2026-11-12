@@ -19,6 +19,7 @@ namespace VkWorkspaceSwitcher
         internal static readonly Color Blue = Color.FromArgb(0, 119, 255);
         internal static readonly Color Selection = Color.FromArgb(34, 53, 75);
         internal static readonly Color Green = Color.FromArgb(75, 179, 113);
+        internal static readonly Color Red = Color.FromArgb(230, 70, 70);
         internal static readonly Icon AppIcon = LoadIcon();
 
         internal static Color ContrastInk(Color color)
@@ -98,6 +99,7 @@ namespace VkWorkspaceSwitcher
         private bool hovered;
         private bool pressed;
         internal bool Primary { get; set; }
+        internal bool Danger { get; set; }
 
         internal DarkButton()
         {
@@ -121,15 +123,15 @@ namespace VkWorkspaceSwitcher
             e.Graphics.Clear(Parent == null ? Theme.Background : Parent.BackColor);
             if (Width < 8 || Height < 8) return;
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            Color fill = !Enabled ? Theme.Surface : Primary ? (pressed ? Color.FromArgb(0, 91, 204) : hovered ? Color.FromArgb(41, 141, 255) : Theme.Blue) : (hovered || pressed ? Theme.Hover : Theme.Surface);
+            Color fill = !Enabled ? Theme.Surface : Danger ? (pressed ? Color.FromArgb(173, 42, 42) : hovered ? Color.FromArgb(242, 87, 87) : Theme.Red) : Primary ? (pressed ? Color.FromArgb(0, 91, 204) : hovered ? Color.FromArgb(41, 141, 255) : Theme.Blue) : (hovered || pressed ? Theme.Hover : Theme.Surface);
             using (GraphicsPath shape = Theme.Rounded(new Rectangle(1, 1, Width - 3, Height - 3), 9))
             using (Brush brush = new SolidBrush(fill))
-            using (Pen edge = new Pen(Focused && ShowFocusCues ? Color.FromArgb(113, 180, 255) : Primary ? fill : Theme.Border))
+            using (Pen edge = new Pen(Focused && ShowFocusCues ? Color.FromArgb(113, 180, 255) : Primary || Danger ? fill : Theme.Border))
             {
                 e.Graphics.FillPath(brush, shape);
                 e.Graphics.DrawPath(edge, shape);
             }
-            TextRenderer.DrawText(e.Graphics, Text, Font, ClientRectangle, Enabled ? (Primary ? Color.White : Theme.Text) : Theme.Muted,
+            TextRenderer.DrawText(e.Graphics, Text, Font, ClientRectangle, Enabled ? (Primary || Danger ? Color.White : Theme.Text) : Theme.Muted,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
         }
     }

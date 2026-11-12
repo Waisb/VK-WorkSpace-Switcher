@@ -26,8 +26,8 @@ namespace VkWorkspaceSwitcher
     }
 
     /// <summary>
-    /// Stores profile labels and prepares isolated child environments. It never
-    /// copies, reads, moves or removes VK WorkSpace session data.
+    /// Stores profile labels and prepares isolated child environments.
+    /// Explicit removal affects only an additional profile's isolated directory.
     /// </summary>
     public sealed class ProfileLauncher
     {
@@ -113,6 +113,95 @@ namespace VkWorkspaceSwitcher
                 WriteState(updated);
                 state = updated;
             }
+        }
+
+        internal string RemoveProfile(string id)
+        {
+            RequireInitialized();
+            ValidateId(id);
+            if (id == "default")
+                throw new InvalidOperationException("Основной профиль нельзя удалить из лаунчера.");
+            using (AcquireLock())
+            {
+                LauncherState updated = ReadState();
+                Profile profile = FindProfile(updated, id);
+                string home = IsolatedHome(id);
+                string staged = null;
+                if (File.Exists(home))
+                    throw new IOException("Вместо папки профиля обнаружен файл. Удаление отменено.");
+                if (Directory.Exists(home))
+                {
+                    ValidateRemovalTree(home);
+                    staged = Path.Combine(Path.GetDirectoryName(home), ".deleted-" + id + "-" + Guid.NewGuid().ToString("N"));
+                    AssertNoReparsePoints(staged);
+                    Directory.Move(home, staged);
+                }
+                updated.Profiles.Remove(profile);
+                try { WriteState(updated); }
+                catch (Exception writeError)
+                {
+                    if (staged != null)
+                    {
+                        try { Directory.Move(staged, home); }
+                        catch (Exception restoreError)
+                        {
+                            throw new IOException("Не удалось сохранить удаление профиля. Его данные сохранены в папке: " + staged +
+                                ". Не удалось вернуть папку на место: " + restoreError.Message, writeError);
+                        }
+                    }
+                    throw;
+                }
+                state = updated;
+                if (staged != null)
+                {
+                    try
+                    {
+                        // Recheck the entire moved tree before deleting any entries.
+                        ValidateRemovalTree(staged);
+                        DeleteRemovalTree(staged);
+                    }
+                    catch (Exception error)
+                    {
+                        return "Аккаунт удалён из лаунчера, но часть локальных файлов осталась в папке:\n" + staged +
+                            "\n\nПричина: " + error.Message;
+                    }
+                }
+                return null;
+            }
+        }
+
+        private static void ValidateRemovalTree(string directory)
+        {
+            AssertNoReparsePoints(directory);
+            foreach (string entry in Directory.EnumerateFileSystemEntries(directory))
+            {
+                FileAttributes attributes = File.GetAttributes(entry);
+                if ((attributes & FileAttributes.ReparsePoint) != 0)
+                    throw new IOException("Профиль содержит ссылку. Удаление отменено: " + entry);
+                if ((attributes & FileAttributes.Directory) != 0)
+                    ValidateRemovalTree(entry);
+            }
+        }
+
+        private static void DeleteRemovalTree(string directory)
+        {
+            // Delete one verified entry at a time; never follow directory links.
+            AssertNoReparsePoints(directory);
+            foreach (string entry in Directory.EnumerateFileSystemEntries(directory))
+            {
+                FileAttributes attributes = File.GetAttributes(entry);
+                if ((attributes & FileAttributes.ReparsePoint) != 0)
+                    throw new IOException("Профиль содержит ссылку: " + entry);
+                if ((attributes & FileAttributes.Directory) != 0)
+                    DeleteRemovalTree(entry);
+                else
+                {
+                    if ((attributes & FileAttributes.ReadOnly) != 0)
+                        File.SetAttributes(entry, attributes & ~FileAttributes.ReadOnly);
+                    File.Delete(entry);
+                }
+            }
+            Directory.Delete(directory, false);
         }
 
         public void SetExecutable(string path)

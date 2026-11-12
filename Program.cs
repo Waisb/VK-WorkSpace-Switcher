@@ -56,12 +56,14 @@ namespace VkWorkspaceSwitcher
         private readonly ToolStripMenuItem rename = new ToolStripMenuItem("Переименовать");
         private readonly ToolStripMenuItem headerColor = new ToolStripMenuItem("Цвет шапки…");
         private readonly ToolStripMenuItem folder = new ToolStripMenuItem("Открыть папку данных");
+        private readonly ToolStripMenuItem delete = new ToolStripMenuItem("Удалить аккаунт…");
         private readonly ToolStripMenuItem settings = new ToolStripMenuItem("Путь к приложению…");
         private readonly ToolTip tooltips = new ToolTip();
         private readonly System.Windows.Forms.Timer refresh = new System.Windows.Forms.Timer();
         private readonly Image headerIcon;
         private bool busy;
         private bool closing;
+        private bool deleting;
         private bool updatingTitles;
         private bool titlesPending;
 
@@ -152,7 +154,8 @@ namespace VkWorkspaceSwitcher
             menu.ShowImageMargin = false;
             menu.ShowCheckMargin = false;
             menu.Padding = new Padding(4);
-            menu.Items.AddRange(new ToolStripItem[] { rename, headerColor, folder, new ToolStripSeparator(), settings });
+            delete.ForeColor = Theme.Red;
+            menu.Items.AddRange(new ToolStripItem[] { rename, headerColor, folder, new ToolStripSeparator(), delete, new ToolStripSeparator(), settings });
             foreach (ToolStripItem item in menu.Items) item.Padding = new Padding(9, 5, 9, 5);
             menu.Opening += delegate(object sender, System.ComponentModel.CancelEventArgs e)
             {
@@ -166,6 +169,7 @@ namespace VkWorkspaceSwitcher
             rename.Click += delegate { RenameSelected(); };
             headerColor.Click += async delegate { await ChangeHeaderColor(); };
             folder.Click += delegate { OpenFolder(); };
+            delete.Click += async delegate { await DeleteSelected(); };
             settings.Click += delegate { SelectExecutable(); };
             open.Click += async delegate { await OpenSelected(); };
             close.Click += async delegate { await CloseSelected(); };
@@ -242,11 +246,41 @@ namespace VkWorkspaceSwitcher
         {
             AccountRow row = Selected;
             open.Enabled = rename.Enabled = headerColor.Enabled = folder.Enabled = row != null && !busy;
+            delete.Enabled = row != null && row.Profile.Id != "default" && !busy;
             add.Enabled = more.Enabled = accounts.Enabled = settings.Enabled = !busy;
             close.Visible = row != null && row.Running;
             close.Enabled = close.Visible && !busy;
             close.Text = closing ? "Закрываю…" : "Закрыть";
-            open.Text = busy && !closing ? "Открываю…" : row != null && row.Running ? "Показать" : "Открыть";
+            open.Text = deleting ? "Удаляю…" : busy && !closing ? "Открываю…" : row != null && row.Running ? "Показать" : "Открыть";
+        }
+
+        private async Task DeleteSelected()
+        {
+            AccountRow row = Selected;
+            if (row == null || row.Profile.Id == "default" || busy) return;
+            using (DeleteDialog dialog = new DeleteDialog(row.Profile.Name))
+            {
+                if (dialog.ShowDialog(this) != DialogResult.OK) return;
+            }
+            int index = accounts.SelectedIndex;
+            busy = deleting = true;
+            UpdateActions();
+            string warning = null;
+            try
+            {
+                warning = await Task.Run(delegate { return runtime.Delete(row.Profile); });
+            }
+            catch (Exception error) { ShowError(error); }
+            finally
+            {
+                busy = deleting = false;
+                if (!IsDisposed)
+                {
+                    Reload(row.Profile.Id);
+                    if (accounts.SelectedIndex < 0) accounts.SelectedIndex = Math.Min(index, accounts.Items.Count - 1);
+                }
+            }
+            if (warning != null) ShowError(new IOException(warning));
         }
 
         private async Task CloseSelected()
@@ -368,6 +402,33 @@ namespace VkWorkspaceSwitcher
             tooltips.Dispose();
             headerIcon.Dispose();
             base.OnFormClosed(e);
+        }
+    }
+
+    internal sealed class DeleteDialog : Form
+    {
+        internal DeleteDialog(string name)
+        {
+            Theme.Apply(this);
+            Text = "Удаление аккаунта";
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = MinimizeBox = false;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.CenterParent;
+            string message = "Удалить «" + name + "»?\n\nОкно аккаунта закроется. Локальные данные профиля, включая сессию и загруженные файлы, будут удалены. Для входа потребуется авторизация заново.";
+            int height = TextRenderer.MeasureText(message, Font, new Size(432, 0), TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix).Height + 8;
+            ClientSize = new Size(480, height + 102);
+            Label text = new Label { Text = message, UseMnemonic = false, Location = new Point(24, 24), Size = new Size(432, height) };
+            DarkButton remove = new DarkButton { Text = "Удалить", Danger = true, DialogResult = DialogResult.OK,
+                Location = new Point(196, height + 42), Size = new Size(128, 38), TabIndex = 1 };
+            DarkButton cancel = new DarkButton { Text = "Отмена", DialogResult = DialogResult.Cancel,
+                Location = new Point(336, height + 42), Size = new Size(120, 38), TabIndex = 0 };
+            Controls.Add(text);
+            Controls.Add(remove);
+            Controls.Add(cancel);
+            // Enter and initial focus default to cancellation.
+            AcceptButton = CancelButton = cancel;
+            Shown += delegate { cancel.Focus(); };
         }
     }
 
